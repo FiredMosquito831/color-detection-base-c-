@@ -43,7 +43,12 @@ The project has been transformed into a modular, testable engineering system wit
 - Live screen-capture validation.
 - A repeatable performance benchmark.
 
-The executable remains detector-only unless `--trigger`, `--track`, or both are explicitly supplied.
+When started **with** arguments, the executable remains detector-only unless
+`--trigger`, `--track`, or both are explicitly supplied.
+
+When started with **no** arguments, which is the double-click case where there
+is no opportunity to pass flags, both controllers are enabled and the process
+requests elevation. `--detector-only` restores observation-only behavior.
 
 ---
 
@@ -836,6 +841,7 @@ Examples:
 | Option | Purpose | Default |
 |---|---|---:|
 | `--trigger` | Enable hold-to-trigger controller | disabled |
+| `--detector-only` | Observe and draw only; no key actuates anything | disabled |
 | `--click` | Alias for `--trigger` | disabled |
 | `--track` | Enable hold-to-pin/follow controller | disabled |
 | `--trigger-key KEY` | Trigger hold key | Mouse 4 |

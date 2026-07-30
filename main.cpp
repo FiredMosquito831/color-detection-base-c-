@@ -50,6 +50,7 @@ struct AppConfig {
     bool diagnosticsEnabled{false};
     bool keyTestRequested{false};
     bool elevateRequested{false};
+    bool detectorOnlyRequested{false};
     bool persistenceEnabled{false};
     double persistenceDecay{0.80};
     double persistenceThreshold{0.45};
@@ -259,6 +260,7 @@ void printHelp() {
         << "  --trigger               Hold trigger key to click on a confirmed center target\n"
         << "  --click                 Alias for --trigger\n"
         << "  --track                 Hold tracking key to pin/follow the closest target\n"
+        << "  --detector-only         Observe and draw only; no keys actuate anything\n"
         << "  --trigger-key KEY       Hold key for trigger mode (default Mouse 4)\n"
         << "  --track-key KEY         Hold key for tracking mode (default Mouse 5)\n"
         << "  --trigger-toggle-key KEY  Latching toggle for trigger mode (default -)\n"
@@ -325,6 +327,8 @@ void printHelp() {
             config.triggerEnabled = true;
         } else if (option == "--track") {
             config.trackingEnabled = true;
+        } else if (option == "--detector-only") {
+            config.detectorOnlyRequested = true;
         } else if (option == "--keytest") {
             config.keyTestRequested = true;
         } else if (option == "--elevate") {
@@ -1403,16 +1407,44 @@ void detectionLoop(
 }  // namespace
 
 int main(int argc, char* argv[]) {
+    // Launching with no arguments is the double-click case, where there is no
+    // opportunity to pass flags. Treat it as "run the thing": enable both
+    // controllers and match the target's integrity level, which is what the
+    // hold keys and toggles need in order to work at all.
+    const bool launchedWithoutArguments = argc <= 1;
+
     try {
         bool helpRequested = false;
-        const AppConfig config = parseArguments(argc, argv, helpRequested);
+        AppConfig config = parseArguments(argc, argv, helpRequested);
         if (helpRequested) {
             printHelp();
             return 0;
         }
 
+        if (launchedWithoutArguments) {
+            config.triggerEnabled = true;
+            config.trackingEnabled = true;
+            config.elevateRequested = true;
+        }
+        if (config.detectorOnlyRequested) {
+            config.triggerEnabled = false;
+            config.trackingEnabled = false;
+        }
+
         if (config.elevateRequested && !isProcessElevated()) {
-            return relaunchElevated(argc, argv) ? 0 : 1;
+            if (relaunchElevated(argc, argv)) {
+                return 0;
+            }
+            // An explicit --elevate is a hard requirement. The implicit
+            // double-click case falls through instead, because an unelevated
+            // detector still works against every target that is not itself
+            // elevated, and refusing to start would be worse than degrading.
+            if (!launchedWithoutArguments) {
+                return 1;
+            }
+            std::cout << "Continuing without elevation. The hold keys and toggles will not "
+                         "work while an\napplication running as administrator holds the "
+                         "foreground.\n\n";
         }
 
         SetProcessDPIAware();
@@ -1443,6 +1475,10 @@ int main(int argc, char* argv[]) {
             std::cout << "Hold " << virtualKeyName(config.trackingVirtualKey)
                       << " to pin/follow the closest target, or press "
                       << virtualKeyName(config.trackingToggleVirtualKey) << " to latch it on.\n";
+        }
+        if (launchedWithoutArguments) {
+            std::cout << "Started with no arguments, so both controllers are enabled.\n"
+                      << "Pass --detector-only to observe without actuating anything.\n";
         }
         if (!config.triggerEnabled && !config.trackingEnabled) {
             std::cout << "Detector-only mode: no keys are active. "
@@ -1496,6 +1532,12 @@ int main(int argc, char* argv[]) {
     } catch (const std::exception& error) {
         std::cerr << "Error: " << error.what() << '\n';
         std::cerr << "Use --help to see valid options.\n";
+        // A double-clicked console window closes the instant main returns, so
+        // the message above would never be readable.
+        if (launchedWithoutArguments) {
+            std::cerr << "\nPress Enter to close.\n";
+            std::cin.get();
+        }
         return 1;
     }
 }

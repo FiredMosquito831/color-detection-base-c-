@@ -68,6 +68,12 @@ Enable both university demonstrations:
 .\build\color_detector.exe --trigger --track
 ```
 
+### Running it
+
+Double-clicking `color_detector.exe` passes no arguments. That case is treated as "run everything": both controllers are enabled and Windows prompts for elevation, which the hold keys and toggles require in order to work over an elevated application. Accept the prompt. Declining still starts the detector, but the keys will not respond while an elevated application holds the foreground.
+
+Starting it **with** any argument keeps the original safe default: detector-only unless `--trigger` or `--track` is present. `--detector-only` forces observation-only mode in either case.
+
 Hold `Mouse 4` for trigger mode, or press `-` to latch it on. Hold `Mouse 5` for pin/track mode, or press `=` to latch it on. Either input style activates its controller, and both stay available at once. `F8` pauses or resumes the entire system, and `F9` exits cleanly.
 
 If a hold key appears to do nothing over another application, that application is almost certainly running as administrator: Windows then blocks both key-state reads and input injection without reporting an error. Restart with `--elevate`, and use `--keytest` to confirm what the process can actually observe.
@@ -101,6 +107,7 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 |---|---|---:|
 | `--trigger` | Enable hold-to-trigger controller | disabled |
 | `--track` | Enable hold-to-pin/follow controller | disabled |
+| `--detector-only` | Observe and draw only; no key actuates anything | disabled |
 | `--trigger-key KEY` | Trigger activation key | `Mouse 4` |
 | `--track-key KEY` | Tracking activation key | `Mouse 5` |
 | `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
