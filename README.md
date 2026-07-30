@@ -68,7 +68,9 @@ Enable both university demonstrations:
 .\build\color_detector.exe --trigger --track
 ```
 
-Hold `Mouse 4` for trigger mode. Hold `Mouse 5` for pin/track mode. `F8` pauses or resumes the entire system, and `F9` exits cleanly.
+Hold `Mouse 4` for trigger mode, or press `-` to latch it on. Hold `Mouse 5` for pin/track mode, or press `=` to latch it on. Either input style activates its controller, and both stay available at once. `F8` pauses or resumes the entire system, and `F9` exits cleanly.
+
+If a hold key appears to do nothing over another application, that application is almost certainly running as administrator: Windows then blocks both key-state reads and input injection without reporting an error. Restart with `--elevate`, and use `--keytest` to confirm what the process can actually observe.
 
 ## University presentation fixture
 
@@ -101,6 +103,8 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 | `--track` | Enable hold-to-pin/follow controller | disabled |
 | `--trigger-key KEY` | Trigger activation key | `Mouse 4` |
 | `--track-key KEY` | Tracking activation key | `Mouse 5` |
+| `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
+| `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
 | `--track-gain VALUE` | Cursor proportional gain | `0.45` |
 | `--track-deadzone PX` | No movement inside this error | `3` |
 | `--track-max-step PX` | Maximum movement per frame | `35` |
@@ -121,6 +125,35 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 | `--confirm FRAMES` | Consecutive detections before activation | `3` |
 | `--release FRAMES` | Consecutive misses before release | `3` |
 | `--cooldown-ms MS` | Minimum time between rising-edge events | `250` |
+| `--keytest` | Report live key state and injection permissions, then exit | — |
+| `--elevate` | Relaunch with an elevated token | disabled |
+
+### Thermal silhouette options
+
+All of these are off by default, so baseline behavior is unchanged.
+
+| Option | Purpose | Default |
+|---|---|---:|
+| `--thermal MODE` | Intensity segmentation: `white`, `black`, or `off` | `off` |
+| `--thermal-threshold N` | Intensity a hot pixel must reach | `170` |
+| `--thermal-contrast N` | Required excess over the local mean | `0` (off) |
+| `--thermal-radius N` | Local-mean window radius | `16` |
+| `--close-radius N` | Morphological closing; bridges thin occluders | `0` (off) |
+| `--merge-gap N` | Merge vertically aligned split components | `0` (off) |
+| `--shape-gate` | Require human-like aspect and fill ratios | disabled |
+| `--aspect MIN,MAX` | Bounding-box width/height range | `0.20,0.95` |
+| `--fill MIN,MAX` | Area over box-area range | `0.20,0.92` |
+| `--profile-gate` | Require a narrower top than middle | disabled |
+| `--min-profile VALUE` | Minimum vertical profile score | `0.15` |
+| `--persistence DECAY` | Cross-frame evidence decay, 0 to below 1 | disabled |
+| `--persistence-threshold V` | Evidence required to retain a pixel | `0.45` |
+| `--thermal-human` | Preset combining every stage above | disabled |
+
+Thermal palettes encode temperature as intensity rather than hue, so Lab distance to a color prototype cannot classify them. `--thermal white` or `--thermal black` segments on luminance instead, and `--thermal-contrast` additionally requires each pixel to stand out from its surroundings, which rejects sky and sunlit walls.
+
+A target seen through foliage, a railing, or a gap arrives as fragments rather than one region. `--close-radius` bridges gaps narrower than its structuring element, `--merge-gap` rejoins pieces too far apart for closing while keeping side-by-side targets distinct, and `--persistence` unions evidence across frames so a target that is never fully visible in any single frame can still be recovered.
+
+The shape and profile gates assume an upright target; a prone or crouched person will be rejected by them.
 
 The built-in target is the legacy yellow prototype. The previous broad dark-red prototype is intentionally opt-in because it produced large false-positive background components during live smoke testing. The first custom `--target` replaces the built-in color; subsequent occurrences add prototypes:
 

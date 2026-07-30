@@ -56,6 +56,10 @@ struct AppConfig {
     double persistenceGain{0.34};
     int triggerVirtualKey{VK_XBUTTON1};
     int trackingVirtualKey{VK_XBUTTON2};
+    // Latching alternatives to the hold keys. Either path activates its
+    // controller; the hold key remains usable while a toggle is off.
+    int triggerToggleVirtualKey{VK_OEM_MINUS};
+    int trackingToggleVirtualKey{VK_OEM_PLUS};
     double trackingGain{0.45};
     int trackingDeadZonePixels{3};
     int trackingMaximumStepPixels{35};
@@ -79,6 +83,8 @@ struct UiSnapshot {
     bool trackingEnabled{};
     bool triggerHeld{};
     bool trackingHeld{};
+    bool triggerToggled{};
+    bool trackingToggled{};
     bool pinVisible{};
     bool pinOccluded{};
     int matchedPixels{};
@@ -201,6 +207,10 @@ struct SharedState {
     if (key == "ralt") return VK_RMENU;
     if (key == "xbutton1" || key == "mouse4") return VK_XBUTTON1;
     if (key == "xbutton2" || key == "mouse5") return VK_XBUTTON2;
+    if (key == "-" || key == "minus") return VK_OEM_MINUS;
+    if (key == "=" || key == "equals" || key == "plus") return VK_OEM_PLUS;
+    if (key == "[" || key == "lbracket") return VK_OEM_4;
+    if (key == "]" || key == "rbracket") return VK_OEM_6;
     if (key.size() >= 2 && key[0] == 'f') {
         const int functionNumber = parseInteger(key.substr(1), "function key");
         if (functionNumber >= 1 && functionNumber <= 24) {
@@ -215,7 +225,8 @@ struct SharedState {
     }
     throw std::invalid_argument(
         "Unsupported key '" + input +
-        "'. Use F1-F24, A-Z, 0-9, space, shift, ctrl, alt, mouse4, or mouse5.");
+        "'. Use F1-F24, A-Z, 0-9, space, shift, ctrl, alt, mouse4, mouse5, "
+        "minus, equals, lbracket, or rbracket.");
 }
 
 [[nodiscard]] std::string virtualKeyName(int virtualKey) {
@@ -233,6 +244,10 @@ struct SharedState {
     if (virtualKey == VK_RMENU) return "Right Alt";
     if (virtualKey == VK_XBUTTON1) return "Mouse 4";
     if (virtualKey == VK_XBUTTON2) return "Mouse 5";
+    if (virtualKey == VK_OEM_MINUS) return "-";
+    if (virtualKey == VK_OEM_PLUS) return "=";
+    if (virtualKey == VK_OEM_4) return "[";
+    if (virtualKey == VK_OEM_6) return "]";
     return "VK " + std::to_string(virtualKey);
 }
 
@@ -246,6 +261,8 @@ void printHelp() {
         << "  --track                 Hold tracking key to pin/follow the closest target\n"
         << "  --trigger-key KEY       Hold key for trigger mode (default Mouse 4)\n"
         << "  --track-key KEY         Hold key for tracking mode (default Mouse 5)\n"
+        << "  --trigger-toggle-key KEY  Latching toggle for trigger mode (default -)\n"
+        << "  --track-toggle-key KEY  Latching toggle for tracking mode (default =)\n"
         << "  --track-gain VALUE      Proportional cursor-follow gain (default 0.45)\n"
         << "  --track-deadzone PX     Stop moving inside this error radius (default 3)\n"
         << "  --track-max-step PX     Maximum relative movement per frame (default 35)\n"
@@ -291,7 +308,8 @@ void printHelp() {
         << "  --known-height METERS   Known real object height for range estimation\n"
         << "  --vfov DEGREES          Calibrated vertical field of view\n"
         << "  --help                   Show this help\n\n"
-        << "Controls: hold Mouse 4 to trigger, hold Mouse 5 to pin/track; F8 pauses; F9 exits.\n";
+        << "Controls: hold Mouse 4 to trigger or press - to latch it on; hold Mouse 5 to\n"
+        << "pin/track or press = to latch it on; F8 pauses; F9 exits.\n";
 }
 
 [[nodiscard]] AppConfig parseArguments(int argc, char* argv[], bool& helpRequested) {
@@ -317,6 +335,12 @@ void printHelp() {
         } else if (option == "--track-key") {
             config.trackingVirtualKey = parseVirtualKey(
                 requireValue(index, argc, argv, "--track-key"));
+        } else if (option == "--trigger-toggle-key") {
+            config.triggerToggleVirtualKey = parseVirtualKey(
+                requireValue(index, argc, argv, "--trigger-toggle-key"));
+        } else if (option == "--track-toggle-key") {
+            config.trackingToggleVirtualKey = parseVirtualKey(
+                requireValue(index, argc, argv, "--track-toggle-key"));
         } else if (option == "--track-gain") {
             config.trackingGain = parseDouble(
                 requireValue(index, argc, argv, "--track-gain"), "tracking gain");
@@ -482,6 +506,12 @@ void printHelp() {
         config.tracker.maximumMissedFrames < 0 || config.tracker.reacquireRadiusPixels <= 0.0 ||
         config.tracker.smoothingFactor <= 0.0 || config.tracker.smoothingFactor > 1.0) {
         throw std::invalid_argument("Tracking controller values are outside their valid range");
+    }
+    if (config.triggerToggleVirtualKey == config.triggerVirtualKey ||
+        config.trackingToggleVirtualKey == config.trackingVirtualKey ||
+        config.triggerToggleVirtualKey == config.trackingToggleVirtualKey) {
+        throw std::invalid_argument(
+            "Each toggle key must differ from its hold key and from the other toggle key");
     }
     if (config.detection.thermalThreshold < 0 || config.detection.thermalThreshold > 255 ||
         config.detection.thermalLocalContrast < 0 || config.detection.thermalLocalContrast > 255 ||
@@ -700,6 +730,8 @@ void runKeyTest(const AppConfig& config) {
     } watched[] = {
         {"trigger", config.triggerVirtualKey},
         {"track", config.trackingVirtualKey},
+        {"trigger-toggle", config.triggerToggleVirtualKey},
+        {"track-toggle", config.trackingToggleVirtualKey},
         {"F8", VK_F8},
         {"F9", VK_F9},
         {"LBUTTON", VK_LBUTTON},
@@ -793,11 +825,26 @@ void drawTrackingLink(HDC dc, const POINT& from, const POINT& to, COLORREF color
     DeleteObject(pen);
 }
 
+// A controller is active either because its hold key is down or because its
+// toggle is latched; the overlay names which, so the operator can tell a stuck
+// toggle from a held button at a glance.
+[[nodiscard]] const wchar_t* controllerStateText(bool enabled, bool active, bool toggled) {
+    if (!enabled) {
+        return L"off";
+    }
+    if (toggled) {
+        return active ? L"TOGGLE" : L"armed";
+    }
+    return active ? L"HELD" : L"armed";
+}
+
 [[nodiscard]] std::wstring snapshotText(const UiSnapshot& snapshot) {
     std::wostringstream output;
     output << (snapshot.enabled ? L"RUN" : L"PAUSED")
-           << L" | trigger=" << (snapshot.triggerEnabled ? (snapshot.triggerHeld ? L"HELD" : L"armed") : L"off")
-           << L" track=" << (snapshot.trackingEnabled ? (snapshot.trackingHeld ? L"HELD" : L"armed") : L"off")
+           << L" | trigger=" << controllerStateText(
+                  snapshot.triggerEnabled, snapshot.triggerHeld, snapshot.triggerToggled)
+           << L" track=" << controllerStateText(
+                  snapshot.trackingEnabled, snapshot.trackingHeld, snapshot.trackingToggled)
            << L" | raw=" << (snapshot.rawDetected ? L"yes" : L"no")
            << L" stable=" << (snapshot.temporallyActive ? L"yes" : L"no")
            << L" pin=" << (snapshot.pinOccluded ? L"OCCLUDED" : (snapshot.pinVisible ? L"VISIBLE" : L"none"))
@@ -1025,8 +1072,45 @@ void detectionLoop(
         const bool pollHotkeys = !state->hotkeysRegistered.load(std::memory_order_relaxed);
         bool previousToggleKeyHeld = false;
         bool warnedAboutBlankCapture = false;
+        bool triggerToggled = false;
+        bool trackingToggled = false;
+        bool previousTriggerToggleKeyHeld = false;
+        bool previousTrackingToggleKeyHeld = false;
 
         while (!state->stop.load(std::memory_order_relaxed)) {
+            // Latching toggles are polled on every iteration, including while
+            // paused, so their state never depends on when they were pressed.
+            if (config.triggerEnabled) {
+                const bool held = isKeyHeld(config.triggerToggleVirtualKey);
+                if (held && !previousTriggerToggleKeyHeld) {
+                    triggerToggled = !triggerToggled;
+                    MessageBeep(triggerToggled ? MB_OK : MB_ICONWARNING);
+                    if (!triggerToggled) {
+                        temporalGate.reset();
+                    }
+                    if (config.diagnosticsEnabled) {
+                        std::cout << "diagnostics trigger_toggle="
+                                  << (triggerToggled ? "on" : "off") << '\n';
+                    }
+                }
+                previousTriggerToggleKeyHeld = held;
+            }
+            if (config.trackingEnabled) {
+                const bool held = isKeyHeld(config.trackingToggleVirtualKey);
+                if (held && !previousTrackingToggleKeyHeld) {
+                    trackingToggled = !trackingToggled;
+                    MessageBeep(trackingToggled ? MB_OK : MB_ICONWARNING);
+                    if (!trackingToggled) {
+                        targetTracker.reset();
+                    }
+                    if (config.diagnosticsEnabled) {
+                        std::cout << "diagnostics track_toggle="
+                                  << (trackingToggled ? "on" : "off") << '\n';
+                    }
+                }
+                previousTrackingToggleKeyHeld = held;
+            }
+
             if (pollHotkeys) {
                 const bool toggleHeld = isKeyHeld(VK_F8);
                 if (toggleHeld && !previousToggleKeyHeld) {
@@ -1055,6 +1139,8 @@ void detectionLoop(
                 snapshot.enabled = false;
                 snapshot.triggerEnabled = config.triggerEnabled;
                 snapshot.trackingEnabled = config.trackingEnabled;
+                snapshot.triggerToggled = triggerToggled;
+                snapshot.trackingToggled = trackingToggled;
                 {
                     std::lock_guard lock(state->snapshotMutex);
                     state->snapshot = snapshot;
@@ -1105,10 +1191,14 @@ void detectionLoop(
                           << (detection.detected ? "entered" : "exited") << '\n';
                 previousDiagnosticCenterDetection = detection.detected;
             }
+            // Either the hold key or the latching toggle activates a
+            // controller, so both input styles stay available at once.
+            const bool triggerKeyDown = isKeyHeld(config.triggerVirtualKey);
+            const bool trackingKeyDown = isKeyHeld(config.trackingVirtualKey);
             const bool triggerHeld =
-                config.triggerEnabled && isKeyHeld(config.triggerVirtualKey);
+                config.triggerEnabled && (triggerKeyDown || triggerToggled);
             const bool trackingHeld =
-                config.trackingEnabled && isKeyHeld(config.trackingVirtualKey);
+                config.trackingEnabled && (trackingKeyDown || trackingToggled);
 
             colorbot::TemporalDecision decision;
             if (triggerHeld) {
@@ -1198,6 +1288,8 @@ void detectionLoop(
             snapshot.trackingEnabled = config.trackingEnabled;
             snapshot.triggerHeld = triggerHeld;
             snapshot.trackingHeld = trackingHeld;
+            snapshot.triggerToggled = triggerToggled;
+            snapshot.trackingToggled = trackingToggled;
             snapshot.pinVisible = trackState.pinned && trackState.visible;
             snapshot.pinOccluded = trackState.pinned && !trackState.visible;
             snapshot.matchedPixels = detection.matchedPixels;
@@ -1295,11 +1387,13 @@ int main(int argc, char* argv[]) {
                   << " tracking=" << (config.trackingEnabled ? "enabled" : "disabled") << '\n';
         if (config.triggerEnabled) {
             std::cout << "Hold " << virtualKeyName(config.triggerVirtualKey)
-                      << " for center-gated trigger mode.\n";
+                      << " for center-gated trigger mode, or press "
+                      << virtualKeyName(config.triggerToggleVirtualKey) << " to latch it on.\n";
         }
         if (config.trackingEnabled) {
             std::cout << "Hold " << virtualKeyName(config.trackingVirtualKey)
-                      << " to pin/follow the closest target.\n";
+                      << " to pin/follow the closest target, or press "
+                      << virtualKeyName(config.trackingToggleVirtualKey) << " to latch it on.\n";
         }
         std::cout << "F8 pauses/resumes; F9 exits.\n";
         if ((config.triggerEnabled || config.trackingEnabled) && !isProcessElevated()) {

@@ -783,9 +783,25 @@ The overlay displays:
 |---|---|
 | Mouse 4 | Hold-to-trigger |
 | Mouse 5 | Hold-to-pin and follow |
+| `-` | Latching toggle for trigger mode |
+| `=` | Latching toggle for pin/follow mode |
 | F8 | Pause/resume complete detector |
 | F9 | Exit detector cleanly |
 | Escape in fixture | Close presentation fixture |
+
+Each controller is active when **either** its hold key is down **or** its
+toggle is latched on, so both input styles remain usable at once. The toggles
+are edge-detected on key-down and are polled even while the detector is paused,
+so their state never depends on when they were pressed.
+
+Latching a toggle off resets the same state that releasing the hold key does:
+the trigger toggle resets the temporal gate, and the tracking toggle resets the
+tracker and drops the pin. Both toggles emit a confirmation beep, and the
+overlay reports `TOGGLE` rather than `HELD` so a latched controller cannot be
+mistaken for a held button.
+
+Each toggle key must differ from its own hold key and from the other toggle
+key; violating this is a startup error.
 
 ### Supported configurable activation keys
 
@@ -798,6 +814,10 @@ The overlay displays:
 - Left or right Alt.
 - Mouse 4 / `xbutton1`.
 - Mouse 5 / `xbutton2`.
+- `-` / `minus`.
+- `=` / `equals` / `plus`.
+- `[` / `lbracket`.
+- `]` / `rbracket`.
 
 Examples:
 
@@ -820,6 +840,8 @@ Examples:
 | `--track` | Enable hold-to-pin/follow controller | disabled |
 | `--trigger-key KEY` | Trigger hold key | Mouse 4 |
 | `--track-key KEY` | Tracking hold key | Mouse 5 |
+| `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
+| `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
 | `--track-gain VALUE` | Proportional cursor-follow gain | `0.45` |
 | `--track-deadzone PX` | Movement dead-zone radius | `3` |
 | `--track-max-step PX` | Maximum relative movement per frame | `35` |
@@ -1760,6 +1782,7 @@ Window 2:
 - [x] Added fourteen silhouette, thermal, and persistence tests.
 - [x] Added key self-test and elevation relaunch.
 - [x] Added polled F8/F9 fallback.
+- [x] Added latching trigger and tracking toggles alongside the hold keys.
 - [x] Added blank-capture warning.
 - [ ] Manually demonstrate physical Mouse 4 trigger hold.
 - [ ] Manually demonstrate physical Mouse 5 tracking hold.
@@ -1776,8 +1799,10 @@ The engineering proof of concept is implemented, compiled, documented, and valid
 The current defaults are:
 
 ```text
-Trigger hold: Mouse 4
-Track hold:   Mouse 5
+Trigger hold:   Mouse 4
+Track hold:     Mouse 5
+Trigger toggle: -
+Track toggle:   =
 Pause:        F8
 Exit:         F9
 ROI:          256x192
