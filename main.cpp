@@ -1035,6 +1035,21 @@ LRESULT CALLBACK overlayWindowProcedure(HWND window, UINT message, WPARAM wParam
     return window;
 }
 
+// The executable is deliberately detector-only unless a mode flag is supplied,
+// which makes an unflagged run look like four dead keybinds. Say so once, on
+// the first press, rather than leaving the operator to guess.
+void reportControllerDisabled(bool& alreadyWarned, const std::string& keyName, const char* flag) {
+    if (alreadyWarned) {
+        return;
+    }
+    alreadyWarned = true;
+    std::cout << keyName << " was pressed, but " << flag
+              << " was not supplied, so that controller is inactive.\n"
+              << "Restart with " << flag << " to enable it. The overlay shows "
+              << (std::string(flag) == "--trigger" ? "trigger=off" : "track=off")
+              << " while it is disabled.\n";
+}
+
 void detectionLoop(
     const AppConfig config,
     SharedState* state,
@@ -1076,39 +1091,73 @@ void detectionLoop(
         bool trackingToggled = false;
         bool previousTriggerToggleKeyHeld = false;
         bool previousTrackingToggleKeyHeld = false;
+        bool warnedAboutDisabledTrigger = false;
+        bool warnedAboutDisabledTracking = false;
 
         while (!state->stop.load(std::memory_order_relaxed)) {
             // Latching toggles are polled on every iteration, including while
             // paused, so their state never depends on when they were pressed.
-            if (config.triggerEnabled) {
+            // They are polled even when their controller is disabled, so that
+            // pressing one in detector-only mode explains itself instead of
+            // appearing to be a broken keybind.
+            {
                 const bool held = isKeyHeld(config.triggerToggleVirtualKey);
                 if (held && !previousTriggerToggleKeyHeld) {
-                    triggerToggled = !triggerToggled;
-                    MessageBeep(triggerToggled ? MB_OK : MB_ICONWARNING);
-                    if (!triggerToggled) {
-                        temporalGate.reset();
-                    }
-                    if (config.diagnosticsEnabled) {
-                        std::cout << "diagnostics trigger_toggle="
-                                  << (triggerToggled ? "on" : "off") << '\n';
+                    if (!config.triggerEnabled) {
+                        reportControllerDisabled(
+                            warnedAboutDisabledTrigger,
+                            virtualKeyName(config.triggerToggleVirtualKey),
+                            "--trigger");
+                    } else {
+                        triggerToggled = !triggerToggled;
+                        MessageBeep(triggerToggled ? MB_OK : MB_ICONWARNING);
+                        if (!triggerToggled) {
+                            temporalGate.reset();
+                        }
+                        if (config.diagnosticsEnabled) {
+                            std::cout << "diagnostics trigger_toggle="
+                                      << (triggerToggled ? "on" : "off") << '\n';
+                        }
                     }
                 }
                 previousTriggerToggleKeyHeld = held;
             }
-            if (config.trackingEnabled) {
+            {
                 const bool held = isKeyHeld(config.trackingToggleVirtualKey);
                 if (held && !previousTrackingToggleKeyHeld) {
-                    trackingToggled = !trackingToggled;
-                    MessageBeep(trackingToggled ? MB_OK : MB_ICONWARNING);
-                    if (!trackingToggled) {
-                        targetTracker.reset();
-                    }
-                    if (config.diagnosticsEnabled) {
-                        std::cout << "diagnostics track_toggle="
-                                  << (trackingToggled ? "on" : "off") << '\n';
+                    if (!config.trackingEnabled) {
+                        reportControllerDisabled(
+                            warnedAboutDisabledTracking,
+                            virtualKeyName(config.trackingToggleVirtualKey),
+                            "--track");
+                    } else {
+                        trackingToggled = !trackingToggled;
+                        MessageBeep(trackingToggled ? MB_OK : MB_ICONWARNING);
+                        if (!trackingToggled) {
+                            targetTracker.reset();
+                        }
+                        if (config.diagnosticsEnabled) {
+                            std::cout << "diagnostics track_toggle="
+                                      << (trackingToggled ? "on" : "off") << '\n';
+                        }
                     }
                 }
                 previousTrackingToggleKeyHeld = held;
+            }
+
+            // The hold keys carry the same trap: without their mode flag they
+            // are read but ignored.
+            if (!config.triggerEnabled && isKeyHeld(config.triggerVirtualKey)) {
+                reportControllerDisabled(
+                    warnedAboutDisabledTrigger,
+                    virtualKeyName(config.triggerVirtualKey),
+                    "--trigger");
+            }
+            if (!config.trackingEnabled && isKeyHeld(config.trackingVirtualKey)) {
+                reportControllerDisabled(
+                    warnedAboutDisabledTracking,
+                    virtualKeyName(config.trackingVirtualKey),
+                    "--track");
             }
 
             if (pollHotkeys) {
@@ -1394,6 +1443,14 @@ int main(int argc, char* argv[]) {
             std::cout << "Hold " << virtualKeyName(config.trackingVirtualKey)
                       << " to pin/follow the closest target, or press "
                       << virtualKeyName(config.trackingToggleVirtualKey) << " to latch it on.\n";
+        }
+        if (!config.triggerEnabled && !config.trackingEnabled) {
+            std::cout << "Detector-only mode: no keys are active. "
+                      << virtualKeyName(config.triggerVirtualKey) << ", "
+                      << virtualKeyName(config.trackingVirtualKey) << ", "
+                      << virtualKeyName(config.triggerToggleVirtualKey) << " and "
+                      << virtualKeyName(config.trackingToggleVirtualKey)
+                      << " will do nothing\nuntil you add --trigger, --track, or both.\n";
         }
         std::cout << "F8 pauses/resumes; F9 exits.\n";
         if ((config.triggerEnabled || config.trackingEnabled) && !isProcessElevated()) {
