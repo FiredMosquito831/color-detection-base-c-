@@ -611,9 +611,25 @@ All of the following must be true:
 
 ### Action
 
-The event sends one left-button-down and one left-button-up input using a single `SendInput` call.
+The event sends one left-button-down, then one left-button-up after
+`--click-hold-ms` milliseconds, as two separate `SendInput` calls.
 
-There is no blocking mouse-hold delay.
+Submitting both in a single batch, as an earlier revision did, gives them the
+same timestamp and delivers them between two consecutive input polls. An
+application that samples button state once per frame then sees the button down
+and up within one sample and registers no click at all. This is why the
+original click worked on the desktop but had no effect in a game.
+
+The release is scheduled and performed by the detection loop rather than by
+sleeping, so the hold duration costs no detection frames. Every exit path from
+the loop, including pause and shutdown, releases a pending press, so the left
+button can never be left stuck down.
+
+Default:
+
+```text
+click hold = 40 ms
+```
 
 ---
 
@@ -704,8 +720,25 @@ After the seventh consecutive miss, the pin is dropped.
 For a visible pin:
 
 ```text
-error = smoothedTargetScreenPosition - currentCursorPosition
+error = smoothedTargetScreenPosition - aimReference
 ```
+
+The aim reference defaults to **screen center**, which is where a game's
+crosshair sits and therefore where its shot lands.
+
+Using the operating-system cursor as the reference, as an earlier revision
+did, is wrong for any application that reads raw input: the pointer is hidden
+and parked, it does not track the view, and it does not respond to injected
+relative movement. The controller then compares the target against a stale
+point every frame and converges *around* the target rather than onto it.
+`--aim-reference cursor` restores the old behavior for desktop demonstrations,
+where the visible pointer really is the thing being steered.
+
+Note that relative mouse counts are not screen pixels. The application
+converts counts to view rotation through its own sensitivity setting, so
+`--track-gain` has to be tuned per game and per sensitivity. Symptoms:
+overshoot and oscillation mean the gain is too high; a slow crawl that never
+arrives means it is too low.
 
 If error magnitude is inside the dead zone, no movement is emitted.
 
@@ -848,6 +881,8 @@ Examples:
 | `--track-key KEY` | Tracking hold key | Mouse 5 |
 | `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
 | `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
+| `--aim-reference WHICH` | Aim from screen `center` or `cursor` | `center` |
+| `--click-hold-ms MS` | Left-button hold duration | `40` |
 | `--track-gain VALUE` | Proportional cursor-follow gain | `0.45` |
 | `--track-deadzone PX` | Movement dead-zone radius | `3` |
 | `--track-max-step PX` | Maximum relative movement per frame | `35` |
@@ -1377,8 +1412,12 @@ F8 pauses:
 
 - Uses relative `SendInput`.
 - Windows pointer acceleration and device settings can influence resulting motion.
-- Tracking follows the object with the system cursor; it does not control a physical camera model.
-- Trigger click occurs at the current cursor position.
+- Relative counts are not screen pixels; the gain must be retuned whenever the
+  application's sensitivity changes.
+- The controller is proportional only. It has no velocity feedforward, so it
+  lags a target moving at constant speed by a fixed error.
+- The aim reference is fixed at screen center or the cursor; a crosshair that
+  is not centered is not modeled.
 
 ### Distance
 

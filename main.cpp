@@ -61,6 +61,13 @@ struct AppConfig {
     // controller; the hold key remains usable while a toggle is off.
     int triggerToggleVirtualKey{VK_OEM_MINUS};
     int trackingToggleVirtualKey{VK_OEM_PLUS};
+    // Aim from the crosshair at screen center rather than the OS cursor. This
+    // is correct for any application that reads raw input and hides its
+    // pointer; cursor mode is for desktop demonstrations.
+    bool aimAtScreenCenter{true};
+    // How long the left button is held down. A game that samples input once
+    // per frame needs the press to span at least one sample.
+    int clickHoldMilliseconds{40};
     double trackingGain{0.45};
     int trackingDeadZonePixels{3};
     int trackingMaximumStepPixels{35};
@@ -265,6 +272,9 @@ void printHelp() {
         << "  --track-key KEY         Hold key for tracking mode (default Mouse 5)\n"
         << "  --trigger-toggle-key KEY  Latching toggle for trigger mode (default -)\n"
         << "  --track-toggle-key KEY  Latching toggle for tracking mode (default =)\n"
+        << "  --aim-reference WHICH   Aim from screen 'center' (crosshair) or 'cursor'\n"
+        << "                          (default center; use cursor for desktop demos)\n"
+        << "  --click-hold-ms MS      Left-button hold duration (default 40)\n"
         << "  --track-gain VALUE      Proportional cursor-follow gain (default 0.45)\n"
         << "  --track-deadzone PX     Stop moving inside this error radius (default 3)\n"
         << "  --track-max-step PX     Maximum relative movement per frame (default 35)\n"
@@ -345,6 +355,19 @@ void printHelp() {
         } else if (option == "--track-toggle-key") {
             config.trackingToggleVirtualKey = parseVirtualKey(
                 requireValue(index, argc, argv, "--track-toggle-key"));
+        } else if (option == "--aim-reference") {
+            const std::string reference = requireValue(index, argc, argv, "--aim-reference");
+            if (reference == "center" || reference == "crosshair") {
+                config.aimAtScreenCenter = true;
+            } else if (reference == "cursor") {
+                config.aimAtScreenCenter = false;
+            } else {
+                throw std::invalid_argument(
+                    "Unsupported aim reference '" + reference + "'. Use center or cursor.");
+            }
+        } else if (option == "--click-hold-ms") {
+            config.clickHoldMilliseconds = parseInteger(
+                requireValue(index, argc, argv, "--click-hold-ms"), "click hold");
         } else if (option == "--track-gain") {
             config.trackingGain = parseDouble(
                 requireValue(index, argc, argv, "--track-gain"), "tracking gain");
@@ -505,6 +528,9 @@ void printHelp() {
         config.detection.maximumComponentFraction > 1.0) {
         throw std::invalid_argument("Saturation, confidence, or area ratio is outside its valid range");
     }
+    if (config.clickHoldMilliseconds < 1 || config.clickHoldMilliseconds > 1000) {
+        throw std::invalid_argument("Click hold must be between 1 and 1000 milliseconds");
+    }
     if (config.trackingGain <= 0.0 || config.trackingGain > 1.0 ||
         config.trackingDeadZonePixels < 0 || config.trackingMaximumStepPixels <= 0 ||
         config.tracker.maximumMissedFrames < 0 || config.tracker.reacquireRadiusPixels <= 0.0 ||
@@ -619,13 +645,26 @@ private:
     std::uint8_t* pixels_{};
 };
 
-[[nodiscard]] bool sendLeftClick() {
-    INPUT inputs[2]{};
-    inputs[0].type = INPUT_MOUSE;
-    inputs[0].mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
-    inputs[1].type = INPUT_MOUSE;
-    inputs[1].mi.dwFlags = MOUSEEVENTF_LEFTUP;
-    return SendInput(2, inputs, sizeof(INPUT)) == 2;
+// Press and release are sent as two separate events separated in time.
+//
+// Submitting both in one SendInput batch gives them the same timestamp and
+// delivers them between two consecutive input polls. An application that
+// samples button state once per frame then observes the button down and up
+// within a single sample and registers no click at all, which is why the
+// original single-batch click had no effect in a game while succeeding on the
+// desktop.
+[[nodiscard]] bool sendLeftButtonDown() {
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTDOWN;
+    return SendInput(1, &input, sizeof(INPUT)) == 1;
+}
+
+[[nodiscard]] bool sendLeftButtonUp() {
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_LEFTUP;
+    return SendInput(1, &input, sizeof(INPUT)) == 1;
 }
 
 [[nodiscard]] bool isKeyHeld(int virtualKey) {
@@ -761,15 +800,25 @@ void runKeyTest(const AppConfig& config) {
     std::cout << "\nKey self-test finished.\n";
 }
 
+// Emits a relative mouse movement that reduces the error between an aim
+// reference point and the target.
+//
+// The reference must be the point the application actually aims from. In a
+// game that is the crosshair at screen center, not the operating-system
+// cursor: the cursor is hidden and parked while the game reads raw input, so
+// it neither tracks the view nor responds to injected relative movement.
+// Driving the loop from GetCursorPos therefore compares the target against a
+// stale point, and the controller converges around the target instead of onto
+// it.
 [[nodiscard]] bool moveCursorToward(
-    const POINT& current,
+    const POINT& reference,
     double targetX,
     double targetY,
     double gain,
     int deadZonePixels,
     int maximumStepPixels) {
-    const double errorX = targetX - current.x;
-    const double errorY = targetY - current.y;
+    const double errorX = targetX - reference.x;
+    const double errorY = targetY - reference.y;
     const double distance = std::hypot(errorX, errorY);
     if (distance <= deadZonePixels) {
         return true;
@@ -1097,6 +1146,20 @@ void detectionLoop(
         bool previousTrackingToggleKeyHeld = false;
         bool warnedAboutDisabledTrigger = false;
         bool warnedAboutDisabledTracking = false;
+        std::optional<Clock::time_point> pendingClickRelease;
+        const POINT screenCenter{screenWidth / 2, screenHeight / 2};
+
+        // A press that is never released leaves the left button stuck down for
+        // the whole system, so every exit path from the loop must release it.
+        const auto releasePendingClick = [&pendingClickRelease]() {
+            if (!pendingClickRelease) {
+                return;
+            }
+            if (!sendLeftButtonUp()) {
+                std::cerr << "Warning: trigger release SendInput failed.\n";
+            }
+            pendingClickRelease.reset();
+        };
 
         while (!state->stop.load(std::memory_order_relaxed)) {
             // Latching toggles are polled on every iteration, including while
@@ -1183,6 +1246,7 @@ void detectionLoop(
             if (!enabled) {
                 temporalGate.reset();
                 targetTracker.reset();
+                releasePendingClick();
                 if (persistence) {
                     persistence->reset();
                 }
@@ -1281,8 +1345,19 @@ void detectionLoop(
                     rangeCandidate->box.height());
             }
 
-            if (decision.triggerEvent) {
-                const bool clickSucceeded = sendLeftClick();
+            // Release a click whose hold time has elapsed. Doing this from the
+            // loop rather than sleeping keeps the detector running during the
+            // hold, so the button duration costs no detection frames.
+            if (pendingClickRelease && Clock::now() >= *pendingClickRelease) {
+                releasePendingClick();
+            }
+
+            if (decision.triggerEvent && !pendingClickRelease) {
+                const bool clickSucceeded = sendLeftButtonDown();
+                if (clickSucceeded) {
+                    pendingClickRelease = Clock::now() +
+                        std::chrono::milliseconds(config.clickHoldMilliseconds);
+                }
                 if (config.soundEnabled) {
                     MessageBeep(MB_OK);
                 }
@@ -1305,11 +1380,16 @@ void detectionLoop(
                           << trackState.candidate.confidence
                           << " area=" << trackState.candidate.area << '\n';
             }
-            if (trackState.pinned && trackState.visible && cursorAvailable) {
+            // Aim from the crosshair by default. Cursor mode remains available
+            // for desktop demonstrations, where the visible pointer is the
+            // thing being steered.
+            const POINT aimReference = config.aimAtScreenCenter ? screenCenter : cursor;
+            const bool referenceAvailable = config.aimAtScreenCenter || cursorAvailable;
+            if (trackState.pinned && trackState.visible && referenceAvailable) {
                 const double targetScreenX = roiLeft + trackState.smoothedX;
                 const double targetScreenY = roiTop + trackState.smoothedY;
                 if (!moveCursorToward(
-                        cursor,
+                        aimReference,
                         targetScreenX,
                         targetScreenY,
                         config.trackingGain,
@@ -1355,8 +1435,11 @@ void detectionLoop(
                 snapshot.pinnedPoint = POINT{
                     static_cast<LONG>(std::lround(roiLeft + trackState.smoothedX)),
                     static_cast<LONG>(std::lround(roiTop + trackState.smoothedY))};
-                if (cursorAvailable) {
-                    snapshot.cursorPoint = cursor;
+                // Draw the aim line from whatever the controller is actually
+                // correcting toward, so the overlay cannot disagree with the
+                // control law.
+                if (referenceAvailable) {
+                    snapshot.cursorPoint = aimReference;
                 }
                 snapshot.componentArea = trackState.candidate.area;
                 snapshot.confidence = trackState.candidate.confidence;
@@ -1397,6 +1480,7 @@ void detectionLoop(
             }
             std::this_thread::sleep_until(nextFrame);
         }
+        releasePendingClick();
     } catch (const std::exception& error) {
         std::cerr << "Detection worker stopped: " << error.what() << '\n';
         state->stop.store(true, std::memory_order_relaxed);

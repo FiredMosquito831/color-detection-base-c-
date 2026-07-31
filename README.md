@@ -76,6 +76,8 @@ Starting it **with** any argument keeps the original safe default: detector-only
 
 Hold `Mouse 4` for trigger mode, or press `-` to latch it on. Hold `Mouse 5` for pin/track mode, or press `=` to latch it on. Either input style activates its controller, and both stay available at once. `F8` pauses or resumes the entire system, and `F9` exits cleanly.
 
+Tracking aims from **screen center**, where a game's crosshair sits. Relative mouse counts are not screen pixels, though: the application converts them to view rotation through its own sensitivity setting, so `--track-gain` needs tuning per game. Overshoot and oscillation mean the gain is too high; a slow crawl that never arrives means it is too low. Use `--aim-reference cursor` for desktop demonstrations, where the visible pointer is the thing being steered.
+
 If a hold key appears to do nothing over another application, that application is almost certainly running as administrator: Windows then blocks both key-state reads and input injection without reporting an error. Restart with `--elevate`, and use `--keytest` to confirm what the process can actually observe.
 
 ## University presentation fixture
@@ -112,6 +114,8 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 | `--track-key KEY` | Tracking activation key | `Mouse 5` |
 | `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
 | `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
+| `--aim-reference WHICH` | Aim from screen `center` (crosshair) or `cursor` | `center` |
+| `--click-hold-ms MS` | Left-button hold duration | `40` |
 | `--track-gain VALUE` | Cursor proportional gain | `0.45` |
 | `--track-deadzone PX` | No movement inside this error | `3` |
 | `--track-max-step PX` | Maximum movement per frame | `35` |
