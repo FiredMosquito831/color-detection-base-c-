@@ -726,6 +726,63 @@ error = smoothedTargetScreenPosition - aimReference
 The aim reference defaults to **screen center**, which is where a game's
 crosshair sits and therefore where its shot lands.
 
+### Unit mismatch and the learned scale
+
+The error above is measured in **screen pixels**, but `SendInput` accepts
+**mouse counts**, and the conversion between them is the application's
+sensitivity setting. Commanding `gain * error` counts therefore applies an
+arbitrary and unknown loop gain.
+
+Let `k` be the pixels of apparent target movement produced by one count. The
+realized loop gain is `gain * k`. When that product exceeds 1 the loop
+overshoots every frame; the step limiter then bounds the overshoot instead of
+correcting it, and the controller settles into a limit cycle that circles the
+target rather than converging on it. At a typical `k` of 3 to 12, the previous
+default gain of 0.45 gave a realized gain of 1.35 to 5.4. This was the cause
+of the reported orbiting, and no fixed gain can fix it, because `k` differs per
+game, per sensitivity setting, and per user.
+
+`AimController` estimates `k` online instead. Injecting `m` counts should
+reduce the error by `k * m`, so each frame yields an observation:
+
+```text
+k_observed = (previousError - currentError) / injectedCounts
+```
+
+Observations are taken only when `|m|` is at least `minimumLearningCounts`,
+are discarded when non-positive, since such a frame was dominated by target or
+player motion rather than by the injection, and are folded into an exponential
+moving average clamped to a plausible range. The command becomes:
+
+```text
+counts = gain * (error + lead * drift) / k_estimate
+```
+
+which is dimensionally correct and gives the same closed-loop behavior at any
+sensitivity. A gain of 1.0 is deadbeat; the 0.65 default leaves margin for
+estimate error.
+
+### Velocity feedforward
+
+`drift` is the part of the observed error change that the injection does not
+explain:
+
+```text
+drift = currentError - (previousError - k_estimate * injectedCounts)
+```
+
+This is the target's own apparent motion. A proportional-only loop carries a
+permanent trailing error against a target moving at constant speed; leading by
+`drift` removes it. `--aim-lead 0` disables this and restores the trailing
+behavior, which the test suite asserts is measurably worse.
+
+### Aim point
+
+The loop aims at the **raw** candidate centroid, not the smoothed one. The
+exponential smoothing exists to keep the overlay readable; feeding its lag into
+a feedback loop is itself a source of limit cycling. `--aim-smoothed` restores
+the old behavior.
+
 Using the operating-system cursor as the reference, as an earlier revision
 did, is wrong for any application that reads raw input: the pointer is hidden
 and parked, it does not track the view, and it does not respond to injected
@@ -882,6 +939,11 @@ Examples:
 | `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
 | `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
 | `--aim-reference WHICH` | Aim from screen `center` or `cursor` | `center` |
+| `--aim-scale VALUE` | Starting pixels-per-count estimate | `1.0` |
+| `--no-aim-learning` | Keep the scale fixed instead of learning it | learning on |
+| `--aim-lead VALUE` | Target-motion feedforward, 0 to 2 | `1.0` |
+| `--aim-smoothed` | Aim at the smoothed centroid | raw centroid |
+| `--soft-gates` | Penalize shape/profile failures instead of rejecting | disabled |
 | `--click-hold-ms MS` | Left-button hold duration | `40` |
 | `--track-gain VALUE` | Proportional cursor-follow gain | `0.45` |
 | `--track-deadzone PX` | Movement dead-zone radius | `3` |
@@ -1138,6 +1200,25 @@ build\detector_core_tests.exe
 - Temporary missing frames preserve the pin.
 - Exceeding missed-frame tolerance drops the pin.
 - Releasing activation immediately clears the pin.
+
+### Aim controller tests
+
+- The loop converges within 25 frames at an unknown sensitivity and stays on
+  target, rather than orbiting it.
+- The learned pixels-per-count scale approaches the simulated true value.
+- One configuration converges at sensitivities spanning `0.15` to `12.0`
+  pixels per count, which no fixed gain achieves.
+- Velocity feedforward keeps a constantly moving target near center, and
+  disabling it measurably increases trailing error.
+- The dead zone suppresses movement and the step limit bounds a single frame.
+- A zero gain is rejected.
+
+### Soft-gate tests
+
+- Hard gates drop a crouched silhouette; soft gates retain it without counting
+  a rejection.
+- A silhouette that passes the gates still outscores one that only survives
+  them, so the penalty is real.
 
 ### Silhouette and thermal tests
 

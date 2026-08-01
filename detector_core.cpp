@@ -535,13 +535,19 @@ DetectionResult analyzeBgra(
             ? static_cast<double>(candidate.area) / (boxWidth * boxHeight)
             : 0.0;
 
+        double gatePenalty = 1.0;
         if (config.shapeGateEnabled) {
-            if (candidate.aspectRatio < config.minimumAspectRatio ||
-                candidate.aspectRatio > config.maximumAspectRatio ||
-                candidate.fillRatio < config.minimumFillRatio ||
-                candidate.fillRatio > config.maximumFillRatio) {
-                ++result.shapeRejections;
-                continue;
+            const bool shapePassed =
+                candidate.aspectRatio >= config.minimumAspectRatio &&
+                candidate.aspectRatio <= config.maximumAspectRatio &&
+                candidate.fillRatio >= config.minimumFillRatio &&
+                candidate.fillRatio <= config.maximumFillRatio;
+            if (!shapePassed) {
+                if (!config.softGates) {
+                    ++result.shapeRejections;
+                    continue;
+                }
+                gatePenalty *= config.softGatePenalty;
             }
         }
 
@@ -556,8 +562,11 @@ DetectionResult analyzeBgra(
             candidate.profileScore = bestProfile;
         }
         if (config.profileGateEnabled && candidate.profileScore < config.minimumProfileScore) {
-            ++result.profileRejections;
-            continue;
+            if (!config.softGates) {
+                ++result.profileRejections;
+                continue;
+            }
+            gatePenalty *= config.softGatePenalty;
         }
 
         const double colorScore = clamp01(1.0 - candidate.meanDeltaE / config.maxDeltaE);
@@ -578,6 +587,7 @@ DetectionResult analyzeBgra(
         // asked for it, so default behavior and its thresholds are unchanged.
         if (config.shapeGateEnabled || config.profileGateEnabled) {
             candidate.confidence = 0.80 * candidate.confidence + 0.20 * candidate.profileScore;
+            candidate.confidence *= gatePenalty;
         }
 
         ++result.acceptedComponents;
@@ -620,6 +630,96 @@ void PersistenceAccumulator::apply(std::uint8_t* mask, double threshold) {
             mask[index] = 1;
         }
     }
+}
+
+AimController::AimController(AimConfig config) : config_(config) {
+    if (config_.gain <= 0.0 || config_.gain > 2.0 || config_.deadZonePixels < 0.0 ||
+        config_.maximumStepCounts <= 0.0 || config_.minimumLearningCounts <= 0.0 ||
+        config_.scaleAdaptationRate <= 0.0 || config_.scaleAdaptationRate > 1.0 ||
+        config_.minimumScale <= 0.0 || config_.maximumScale <= config_.minimumScale ||
+        config_.initialScale < config_.minimumScale ||
+        config_.initialScale > config_.maximumScale ||
+        config_.velocityFeedforward < 0.0 || config_.velocityFeedforward > 2.0) {
+        throw std::invalid_argument("Invalid aim controller configuration");
+    }
+    scaleX_ = config_.initialScale;
+    scaleY_ = config_.initialScale;
+}
+
+void AimController::learn(
+    double previousError,
+    double currentError,
+    double injectedCounts,
+    double& scale) {
+    if (!config_.learningEnabled || std::abs(injectedCounts) < config_.minimumLearningCounts) {
+        return;
+    }
+    // Injecting counts toward the target reduces the error by scale * counts,
+    // so the realized scale is the error change divided by what was injected.
+    const double observed = (previousError - currentError) / injectedCounts;
+    if (!std::isfinite(observed) || observed <= 0.0) {
+        // A negative or zero response means the frame was dominated by target
+        // or player motion rather than by the injection. Learning from it
+        // would corrupt the estimate.
+        return;
+    }
+    const double clamped = std::clamp(observed, config_.minimumScale, config_.maximumScale);
+    scale += config_.scaleAdaptationRate * (clamped - scale);
+    scale = std::clamp(scale, config_.minimumScale, config_.maximumScale);
+}
+
+AimCommand AimController::update(double errorX, double errorY) {
+    if (hasPreviousFrame_) {
+        learn(previousErrorX_, errorX, previousCountsX_, scaleX_);
+        learn(previousErrorY_, errorY, previousCountsY_, scaleY_);
+    }
+
+    // Whatever the injection does not account for is the target's own motion.
+    // Leading by it removes the constant lag a proportional loop otherwise
+    // carries against a target moving at constant speed.
+    double driftX = 0.0;
+    double driftY = 0.0;
+    if (hasPreviousFrame_) {
+        driftX = errorX - (previousErrorX_ - scaleX_ * previousCountsX_);
+        driftY = errorY - (previousErrorY_ - scaleY_ * previousCountsY_);
+    }
+
+    const double aimX = errorX + config_.velocityFeedforward * driftX;
+    const double aimY = errorY + config_.velocityFeedforward * driftY;
+
+    AimCommand command;
+    const double distance = std::hypot(errorX, errorY);
+    if (distance > config_.deadZonePixels) {
+        command.countsX = config_.gain * aimX / scaleX_;
+        command.countsY = config_.gain * aimY / scaleY_;
+
+        const double magnitude = std::hypot(command.countsX, command.countsY);
+        if (magnitude > config_.maximumStepCounts && magnitude > 0.0) {
+            const double limit = config_.maximumStepCounts / magnitude;
+            command.countsX *= limit;
+            command.countsY *= limit;
+        }
+        command.move = std::llround(command.countsX) != 0 || std::llround(command.countsY) != 0;
+    }
+
+    hasPreviousFrame_ = true;
+    previousErrorX_ = errorX;
+    previousErrorY_ = errorY;
+    // Record what will actually be injected, including rounding, so the scale
+    // estimate is not biased by the fractional part that never reaches the OS.
+    previousCountsX_ = command.move ? static_cast<double>(std::llround(command.countsX)) : 0.0;
+    previousCountsY_ = command.move ? static_cast<double>(std::llround(command.countsY)) : 0.0;
+    return command;
+}
+
+void AimController::reset() {
+    hasPreviousFrame_ = false;
+    previousErrorX_ = 0.0;
+    previousErrorY_ = 0.0;
+    previousCountsX_ = 0.0;
+    previousCountsY_ = 0.0;
+    scaleX_ = config_.initialScale;
+    scaleY_ = config_.initialScale;
 }
 
 void PersistenceAccumulator::reset() {

@@ -76,7 +76,11 @@ Starting it **with** any argument keeps the original safe default: detector-only
 
 Hold `Mouse 4` for trigger mode, or press `-` to latch it on. Hold `Mouse 5` for pin/track mode, or press `=` to latch it on. Either input style activates its controller, and both stay available at once. `F8` pauses or resumes the entire system, and `F9` exits cleanly.
 
-Tracking aims from **screen center**, where a game's crosshair sits. Relative mouse counts are not screen pixels, though: the application converts them to view rotation through its own sensitivity setting, so `--track-gain` needs tuning per game. Overshoot and oscillation mean the gain is too high; a slow crawl that never arrives means it is too low. Use `--aim-reference cursor` for desktop demonstrations, where the visible pointer is the thing being steered.
+Tracking aims from **screen center**, where a game's crosshair sits.
+
+Relative mouse counts are not screen pixels: the application converts them to view rotation through its own sensitivity setting. The controller measures how far the target actually moved in response to the counts it sent, learns that pixels-per-count ratio at runtime, and scales its output by it. This is why the aim no longer circles the target the way a fixed pixel gain does, and why the same settings work across sensitivities. The overlay shows the learned value as `learned px/count` while tracking is active; it should stabilize within a second or two of holding the key.
+
+If it still misbehaves, `--track-gain` sets how much of the correction to apply per frame (`1.0` arrives in one frame, `0.65` is the default). `--aim-scale` plus `--no-aim-learning` pins the ratio manually. `--aim-reference cursor` restores cursor-relative aiming for desktop demonstrations.
 
 If a hold key appears to do nothing over another application, that application is almost certainly running as administrator: Windows then blocks both key-state reads and input injection without reporting an error. Restart with `--elevate`, and use `--keytest` to confirm what the process can actually observe.
 
@@ -116,7 +120,12 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 | `--track-toggle-key KEY` | Latching toggle for tracking mode | `=` |
 | `--aim-reference WHICH` | Aim from screen `center` (crosshair) or `cursor` | `center` |
 | `--click-hold-ms MS` | Left-button hold duration | `40` |
-| `--track-gain VALUE` | Cursor proportional gain | `0.45` |
+| `--track-gain VALUE` | Aim loop gain; `1.0` arrives in one frame | `0.65` |
+| `--aim-scale VALUE` | Starting pixels-per-count estimate | `1.0` |
+| `--no-aim-learning` | Keep `--aim-scale` fixed instead of learning it | learning on |
+| `--aim-lead VALUE` | How much target motion to lead, 0 to 2 | `1.0` |
+| `--aim-smoothed` | Aim at the smoothed centroid instead of the raw one | raw |
+| `--soft-gates` | Penalize shape/profile failures instead of rejecting | disabled |
 | `--track-deadzone PX` | No movement inside this error | `3` |
 | `--track-max-step PX` | Maximum movement per frame | `35` |
 | `--reacquire-radius PX` | Identity-association search radius | `80` |

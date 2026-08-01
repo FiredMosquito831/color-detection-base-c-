@@ -107,6 +107,14 @@ struct DetectionConfig {
     // which distinguishes an upright human from a blob or a rectangle.
     bool profileGateEnabled{false};
     double minimumProfileScore{0.15};
+
+    // Treat the shape and profile gates as confidence penalties rather than
+    // hard rejections. A silhouette that is briefly crouched, turned, or
+    // partly cut off fails the gates for a few frames; dropping it outright
+    // makes detection flicker, whereas penalizing it keeps the track alive and
+    // lets --confidence make the final call.
+    bool softGates{false};
+    double softGatePenalty{0.65};
 };
 
 struct DetectionResult {
@@ -245,6 +253,73 @@ private:
     double smoothedX_{};
     double smoothedY_{};
     Candidate lastCandidate_;
+};
+
+struct AimConfig {
+    // Fraction of the computed correction to apply. 1.0 is deadbeat (arrive in
+    // one frame) and is intentionally not the default, because a deadbeat loop
+    // has no margin for scale-estimate error.
+    double gain{0.65};
+    double deadZonePixels{2.0};
+    double maximumStepCounts{80.0};
+    // Injections smaller than this teach the scale estimator nothing useful,
+    // because sub-count rounding and detection jitter dominate the response.
+    double minimumLearningCounts{2.0};
+    double scaleAdaptationRate{0.25};
+    double minimumScale{0.02};
+    double maximumScale{40.0};
+    // Pixels of apparent target movement produced by one injected count. The
+    // correct value depends on the application's sensitivity, so it is learned
+    // at runtime unless learning is disabled.
+    double initialScale{1.0};
+    bool learningEnabled{true};
+    // How much of the target's own observed motion to lead. 1.0 aims where the
+    // target will be rather than where it was, which removes the steady-state
+    // lag a proportional-only loop has against a moving target.
+    double velocityFeedforward{1.0};
+};
+
+struct AimCommand {
+    double countsX{};
+    double countsY{};
+    bool move{};
+};
+
+// Proportional aim loop with an online estimate of the pixels-per-count scale.
+//
+// The error is measured in screen pixels but the actuator accepts mouse
+// counts, and the conversion between them is the application's sensitivity,
+// which is unknown and varies per game and per user. Commanding gain * error
+// counts therefore applies an arbitrary loop gain: when one count moves the
+// target more than one pixel the loop overshoots every frame and settles into
+// a limit cycle that circles the target instead of converging on it.
+//
+// This controller measures how far the target actually moved in response to
+// the counts it injected, estimates the scale from that response, and commands
+// error / scale instead. It also estimates the component of target motion that
+// its own injection does not explain, and leads the target by that amount.
+class AimController {
+public:
+    explicit AimController(AimConfig config);
+
+    // errorX and errorY are pixels from the aim reference to the target.
+    [[nodiscard]] AimCommand update(double errorX, double errorY);
+    void reset();
+
+    [[nodiscard]] double scaleX() const { return scaleX_; }
+    [[nodiscard]] double scaleY() const { return scaleY_; }
+
+private:
+    void learn(double previousError, double currentError, double injectedCounts, double& scale);
+
+    AimConfig config_;
+    bool hasPreviousFrame_{};
+    double previousErrorX_{};
+    double previousErrorY_{};
+    double previousCountsX_{};
+    double previousCountsY_{};
+    double scaleX_{};
+    double scaleY_{};
 };
 
 }  // namespace colorbot

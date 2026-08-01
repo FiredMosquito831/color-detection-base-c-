@@ -509,6 +509,163 @@ void testPersistenceRejectsInvalidConfiguration() {
     require(threw, "A persistence buffer of the wrong size must be rejected");
 }
 
+// Simulates an application whose sensitivity converts one injected mouse count
+// into pixelsPerCount pixels of apparent target movement, which is the
+// conversion the aim controller has to discover.
+struct SimulatedView {
+    double pixelsPerCount{};
+    double errorX{};
+    double errorY{};
+    double driftPerFrameX{};
+    double driftPerFrameY{};
+
+    void apply(const colorbot::AimCommand& command) {
+        const double countsX = command.move ? std::llround(command.countsX) : 0.0;
+        const double countsY = command.move ? std::llround(command.countsY) : 0.0;
+        errorX = errorX - pixelsPerCount * countsX + driftPerFrameX;
+        errorY = errorY - pixelsPerCount * countsY + driftPerFrameY;
+    }
+};
+
+void testAimControllerConvergesDespiteUnknownSensitivity() {
+    // A fixed proportional gain in pixels is what caused the original limit
+    // cycle: with 3 pixels of movement per count, commanding 0.45 * error
+    // counts overshoots by 1.35x every frame and never settles.
+    colorbot::AimConfig config;
+    colorbot::AimController controller(config);
+    SimulatedView view{3.0, 220.0, -160.0, 0.0, 0.0};
+
+    int framesToSettle = -1;
+    for (int frame = 0; frame < 60; ++frame) {
+        const auto command = controller.update(view.errorX, view.errorY);
+        view.apply(command);
+        if (framesToSettle < 0 && std::hypot(view.errorX, view.errorY) <= 3.0) {
+            framesToSettle = frame + 1;
+        }
+    }
+
+    require(framesToSettle > 0, "The aim loop must reach the target");
+    require(framesToSettle <= 25, "The aim loop must converge quickly, not orbit");
+    require(
+        std::hypot(view.errorX, view.errorY) <= 3.0,
+        "The aim loop must stay on target once it arrives");
+    require(
+        std::abs(controller.scaleX() - view.pixelsPerCount) < 0.5,
+        "The controller should learn the application's pixels-per-count scale");
+}
+
+void testAimControllerHandlesBothHighAndLowSensitivity() {
+    // The same configuration must work at sensitivities two orders of
+    // magnitude apart, which no fixed gain can do.
+    for (const double pixelsPerCount : {0.15, 1.0, 12.0}) {
+        colorbot::AimController controller{colorbot::AimConfig{}};
+        SimulatedView view{pixelsPerCount, 300.0, 200.0, 0.0, 0.0};
+        for (int frame = 0; frame < 120; ++frame) {
+            view.apply(controller.update(view.errorX, view.errorY));
+        }
+        require(
+            std::hypot(view.errorX, view.errorY) <= 4.0,
+            "The aim loop must converge at every sensitivity");
+    }
+}
+
+void testAimControllerLeadsAMovingTarget() {
+    colorbot::AimConfig config;
+    colorbot::AimController controller(config);
+    // A target drifting 6 px per frame is what leaves a proportional-only loop
+    // with a permanent trailing error.
+    SimulatedView view{2.0, 150.0, 0.0, 6.0, 0.0};
+    for (int frame = 0; frame < 120; ++frame) {
+        view.apply(controller.update(view.errorX, view.errorY));
+    }
+    require(
+        std::abs(view.errorX) <= 8.0,
+        "Velocity feedforward should keep a constantly moving target near center");
+
+    colorbot::AimConfig noLead = config;
+    noLead.velocityFeedforward = 0.0;
+    colorbot::AimController laggingController(noLead);
+    SimulatedView lagging{2.0, 150.0, 0.0, 6.0, 0.0};
+    for (int frame = 0; frame < 120; ++frame) {
+        lagging.apply(laggingController.update(lagging.errorX, lagging.errorY));
+    }
+    require(
+        std::abs(lagging.errorX) > std::abs(view.errorX),
+        "Disabling feedforward should measurably increase trailing error");
+}
+
+void testAimControllerRespectsDeadZoneAndStepLimit() {
+    colorbot::AimConfig config;
+    config.deadZonePixels = 5.0;
+    config.maximumStepCounts = 10.0;
+    colorbot::AimController controller(config);
+
+    const auto inside = controller.update(3.0, 0.0);
+    require(!inside.move, "No movement should be emitted inside the dead zone");
+
+    controller.reset();
+    const auto far = controller.update(5000.0, 5000.0);
+    require(
+        std::hypot(far.countsX, far.countsY) <= 10.0 + 1e-9,
+        "A single frame must never exceed the configured step limit");
+}
+
+void testAimControllerRejectsInvalidConfiguration() {
+    bool threw = false;
+    try {
+        colorbot::AimConfig config;
+        config.gain = 0.0;
+        colorbot::AimController controller(config);
+        (void)controller;
+    } catch (const std::invalid_argument&) {
+        threw = true;
+    }
+    require(threw, "A zero gain must be rejected");
+}
+
+void testSoftGatesKeepImperfectSilhouettes() {
+    constexpr int width = 48;
+    constexpr int height = 48;
+    const colorbot::Rgb yellow{255, 255, 35};
+    const std::vector targets{colorbot::makePrototype("yellow", yellow)};
+
+    // A crouched target: too wide and too solid to pass the shape gate.
+    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(width) * height * 4, 0);
+    for (int y = 18; y < 30; ++y) {
+        for (int x = 16; x < 32; ++x) {
+            setPixel(pixels, width, x, y, yellow);
+        }
+    }
+
+    auto config = testConfig();
+    config.shapeGateEnabled = true;
+    config.profileGateEnabled = true;
+    config.minimumComponentPixels = 20;
+    config.minimumConfidence = 0.0;
+
+    const auto hard = colorbot::analyzeBgra(
+        pixels.data(), width, height, width * 4, targets, config);
+    require(hard.candidates.empty(), "Hard gates drop a silhouette that fails them");
+
+    config.softGates = true;
+    const auto soft = colorbot::analyzeBgra(
+        pixels.data(), width, height, width * 4, targets, config);
+    require(!soft.candidates.empty(), "Soft gates should retain it as a lower-confidence candidate");
+    require(
+        soft.shapeRejections == 0 && soft.profileRejections == 0,
+        "Soft gates penalize rather than reject");
+
+    // The penalty has to be real, or soft gates would be the same as no gates.
+    std::vector<std::uint8_t> upright(static_cast<std::size_t>(width) * height * 4, 0);
+    drawSilhouette(upright, width, 19, 14, yellow);
+    const auto uprightResult = colorbot::analyzeBgra(
+        upright.data(), width, height, width * 4, targets, config);
+    require(!uprightResult.candidates.empty(), "An upright silhouette still passes");
+    require(
+        uprightResult.candidates.front().confidence > soft.candidates.front().confidence,
+        "A silhouette that passes the gates must outscore one that only survives them");
+}
+
 }  // namespace
 
 int main() {
@@ -527,6 +684,12 @@ int main() {
         testThermalLocalContrastRejectsUniformBrightness();
         testPersistenceRecoversIntermittentTarget();
         testPersistenceRejectsInvalidConfiguration();
+        testAimControllerConvergesDespiteUnknownSensitivity();
+        testAimControllerHandlesBothHighAndLowSensitivity();
+        testAimControllerLeadsAMovingTarget();
+        testAimControllerRespectsDeadZoneAndStepLimit();
+        testAimControllerRejectsInvalidConfiguration();
+        testSoftGatesKeepImperfectSilhouettes();
         runSyntheticBenchmark();
         std::cout << "All detector-core tests passed.\n";
         return EXIT_SUCCESS;

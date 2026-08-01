@@ -68,9 +68,9 @@ struct AppConfig {
     // How long the left button is held down. A game that samples input once
     // per frame needs the press to span at least one sample.
     int clickHoldMilliseconds{40};
-    double trackingGain{0.45};
-    int trackingDeadZonePixels{3};
-    int trackingMaximumStepPixels{35};
+    // Aim at the raw centroid; smoothing lag in the loop causes limit cycling.
+    bool aimUsesRawCentroid{true};
+    colorbot::AimConfig aim;
     double knownObjectHeight{};
     double verticalFovDegrees{};
     colorbot::DetectionConfig detection;
@@ -105,6 +105,10 @@ struct UiSnapshot {
     double aspectRatio{};
     double fillRatio{};
     bool silhouetteTelemetry{};
+    double aimScaleX{};
+    double aimScaleY{};
+    double aimErrorPixels{};
+    bool aimActive{};
     double confidence{};
     double processingMilliseconds{};
     double loopFps{};
@@ -275,9 +279,14 @@ void printHelp() {
         << "  --aim-reference WHICH   Aim from screen 'center' (crosshair) or 'cursor'\n"
         << "                          (default center; use cursor for desktop demos)\n"
         << "  --click-hold-ms MS      Left-button hold duration (default 40)\n"
-        << "  --track-gain VALUE      Proportional cursor-follow gain (default 0.45)\n"
-        << "  --track-deadzone PX     Stop moving inside this error radius (default 3)\n"
-        << "  --track-max-step PX     Maximum relative movement per frame (default 35)\n"
+        << "  --track-gain VALUE      Aim loop gain; 1.0 arrives in one frame (default 0.65)\n"
+        << "  --track-deadzone PX     Stop moving inside this error radius (default 2)\n"
+        << "  --track-max-step PX     Maximum mouse counts per frame (default 80)\n"
+        << "  --aim-scale VALUE       Starting pixels-per-count estimate (default 1.0)\n"
+        << "  --no-aim-learning       Keep --aim-scale fixed instead of learning it\n"
+        << "  --aim-lead VALUE        How much target motion to lead, 0 to 2 (default 1.0)\n"
+        << "  --aim-smoothed          Aim at the smoothed centroid instead of the raw one\n"
+        << "  --soft-gates            Penalize shape/profile failures instead of rejecting\n"
         << "  --reacquire-radius PX   Maximum target association distance (default 80)\n"
         << "  --occlusion-frames N    Frames to retain a temporarily hidden pin (default 6)\n"
         << "  --pin-smoothing VALUE   Target-position EMA from 0 to 1 (default 0.35)\n"
@@ -369,14 +378,26 @@ void printHelp() {
             config.clickHoldMilliseconds = parseInteger(
                 requireValue(index, argc, argv, "--click-hold-ms"), "click hold");
         } else if (option == "--track-gain") {
-            config.trackingGain = parseDouble(
+            config.aim.gain = parseDouble(
                 requireValue(index, argc, argv, "--track-gain"), "tracking gain");
         } else if (option == "--track-deadzone") {
-            config.trackingDeadZonePixels = parseInteger(
+            config.aim.deadZonePixels = parseDouble(
                 requireValue(index, argc, argv, "--track-deadzone"), "tracking dead zone");
         } else if (option == "--track-max-step") {
-            config.trackingMaximumStepPixels = parseInteger(
+            config.aim.maximumStepCounts = parseDouble(
                 requireValue(index, argc, argv, "--track-max-step"), "tracking maximum step");
+        } else if (option == "--aim-scale") {
+            config.aim.initialScale = parseDouble(
+                requireValue(index, argc, argv, "--aim-scale"), "aim scale");
+        } else if (option == "--no-aim-learning") {
+            config.aim.learningEnabled = false;
+        } else if (option == "--aim-lead") {
+            config.aim.velocityFeedforward = parseDouble(
+                requireValue(index, argc, argv, "--aim-lead"), "aim lead");
+        } else if (option == "--aim-smoothed") {
+            config.aimUsesRawCentroid = false;
+        } else if (option == "--soft-gates") {
+            config.detection.softGates = true;
         } else if (option == "--reacquire-radius") {
             config.tracker.reacquireRadiusPixels = parseDouble(
                 requireValue(index, argc, argv, "--reacquire-radius"), "reacquire radius");
@@ -489,8 +510,16 @@ void printHelp() {
             config.detection.shapeGateEnabled = true;
             config.detection.profileGateEnabled = true;
             config.detection.minimumComponentPixels = 24;
+            // Soft gates keep an intermittently-posed silhouette on the
+            // candidate list instead of dropping it for the frames where it
+            // crouches or turns, which is what made detection flicker.
+            config.detection.softGates = true;
             config.persistenceEnabled = true;
             config.persistenceDecay = 0.80;
+            // Two frames of confirmation instead of three removes one frame of
+            // trigger latency; the silhouette gates already suppress the
+            // single-frame anomalies that motivated three.
+            config.temporal.confirmationFrames = 2;
         } else if (option == "--confidence") {
             config.detection.minimumConfidence = parseDouble(
                 requireValue(index, argc, argv, "--confidence"), "confidence");
@@ -531,12 +560,14 @@ void printHelp() {
     if (config.clickHoldMilliseconds < 1 || config.clickHoldMilliseconds > 1000) {
         throw std::invalid_argument("Click hold must be between 1 and 1000 milliseconds");
     }
-    if (config.trackingGain <= 0.0 || config.trackingGain > 1.0 ||
-        config.trackingDeadZonePixels < 0 || config.trackingMaximumStepPixels <= 0 ||
-        config.tracker.maximumMissedFrames < 0 || config.tracker.reacquireRadiusPixels <= 0.0 ||
+    if (config.tracker.maximumMissedFrames < 0 || config.tracker.reacquireRadiusPixels <= 0.0 ||
         config.tracker.smoothingFactor <= 0.0 || config.tracker.smoothingFactor > 1.0) {
         throw std::invalid_argument("Tracking controller values are outside their valid range");
     }
+    // The aim controller validates its own configuration, so construct one
+    // here to surface an invalid combination as a startup error rather than as
+    // a worker-thread exception once tracking is first held.
+    (void)colorbot::AimController(config.aim);
     if (config.triggerToggleVirtualKey == config.triggerVirtualKey ||
         config.trackingToggleVirtualKey == config.trackingVirtualKey ||
         config.triggerToggleVirtualKey == config.trackingToggleVirtualKey) {
@@ -810,26 +841,9 @@ void runKeyTest(const AppConfig& config) {
 // Driving the loop from GetCursorPos therefore compares the target against a
 // stale point, and the controller converges around the target instead of onto
 // it.
-[[nodiscard]] bool moveCursorToward(
-    const POINT& reference,
-    double targetX,
-    double targetY,
-    double gain,
-    int deadZonePixels,
-    int maximumStepPixels) {
-    const double errorX = targetX - reference.x;
-    const double errorY = targetY - reference.y;
-    const double distance = std::hypot(errorX, errorY);
-    if (distance <= deadZonePixels) {
-        return true;
-    }
-
-    double scale = gain;
-    if (distance * scale > maximumStepPixels) {
-        scale = static_cast<double>(maximumStepPixels) / distance;
-    }
-    const LONG movementX = static_cast<LONG>(std::lround(errorX * scale));
-    const LONG movementY = static_cast<LONG>(std::lround(errorY * scale));
+[[nodiscard]] bool sendRelativeMouseMove(double countsX, double countsY) {
+    const LONG movementX = static_cast<LONG>(std::lround(countsX));
+    const LONG movementY = static_cast<LONG>(std::lround(countsY));
     if (movementX == 0 && movementY == 0) {
         return true;
     }
@@ -909,6 +923,11 @@ void drawTrackingLink(HDC dc, const POINT& from, const POINT& to, COLORREF color
            << L" fps=" << std::setprecision(1) << snapshot.loopFps;
     if (snapshot.distance) {
         output << L" | range~" << std::setprecision(2) << *snapshot.distance;
+    }
+    if (snapshot.aimActive) {
+        output << L"\naim: error=" << std::setprecision(1) << snapshot.aimErrorPixels << L" px"
+               << L" learned px/count=" << std::setprecision(2) << snapshot.aimScaleX
+               << L"," << snapshot.aimScaleY;
     }
     if (snapshot.silhouetteTelemetry) {
         output << L"\nsilhouette: aspect=" << std::setprecision(2) << snapshot.aspectRatio
@@ -1148,6 +1167,12 @@ void detectionLoop(
         bool warnedAboutDisabledTracking = false;
         std::optional<Clock::time_point> pendingClickRelease;
         const POINT screenCenter{screenWidth / 2, screenHeight / 2};
+        colorbot::AimController aimController(config.aim);
+        double aimScaleX = config.aim.initialScale;
+        double aimScaleY = config.aim.initialScale;
+        double aimErrorPixels = 0.0;
+        bool aimActive = false;
+        auto lastOverlayPost = Clock::now();
 
         // A press that is never released leaves the left button stuck down for
         // the whole system, so every exit path from the loop must release it.
@@ -1246,6 +1271,7 @@ void detectionLoop(
             if (!enabled) {
                 temporalGate.reset();
                 targetTracker.reset();
+                aimController.reset();
                 releasePendingClick();
                 if (persistence) {
                     persistence->reset();
@@ -1386,17 +1412,29 @@ void detectionLoop(
             const POINT aimReference = config.aimAtScreenCenter ? screenCenter : cursor;
             const bool referenceAvailable = config.aimAtScreenCenter || cursorAvailable;
             if (trackState.pinned && trackState.visible && referenceAvailable) {
-                const double targetScreenX = roiLeft + trackState.smoothedX;
-                const double targetScreenY = roiTop + trackState.smoothedY;
-                if (!moveCursorToward(
-                        aimReference,
-                        targetScreenX,
-                        targetScreenY,
-                        config.trackingGain,
-                        config.trackingDeadZonePixels,
-                        config.trackingMaximumStepPixels)) {
+                // Aim at the raw centroid rather than the smoothed one. The
+                // exponential smoothing exists to keep the overlay readable,
+                // but feeding its lag into the aim loop is what a limit cycle
+                // is made of; the controller does its own leading instead.
+                const double targetScreenX = config.aimUsesRawCentroid
+                    ? roiLeft + trackState.candidate.centroidX
+                    : roiLeft + trackState.smoothedX;
+                const double targetScreenY = config.aimUsesRawCentroid
+                    ? roiTop + trackState.candidate.centroidY
+                    : roiTop + trackState.smoothedY;
+                const double aimErrorX = targetScreenX - aimReference.x;
+                const double aimErrorY = targetScreenY - aimReference.y;
+                const colorbot::AimCommand command = aimController.update(aimErrorX, aimErrorY);
+                if (command.move && !sendRelativeMouseMove(command.countsX, command.countsY)) {
                     std::cerr << "Warning: tracking movement SendInput failed.\n";
                 }
+                aimScaleX = aimController.scaleX();
+                aimScaleY = aimController.scaleY();
+                aimErrorPixels = std::hypot(aimErrorX, aimErrorY);
+                aimActive = true;
+            } else {
+                aimController.reset();
+                aimActive = false;
             }
 
             const auto processingEnd = Clock::now();
@@ -1456,6 +1494,10 @@ void detectionLoop(
                 snapshot.aspectRatio = detection.best->aspectRatio;
                 snapshot.fillRatio = detection.best->fillRatio;
             }
+            snapshot.aimScaleX = aimScaleX;
+            snapshot.aimScaleY = aimScaleY;
+            snapshot.aimErrorPixels = aimErrorPixels;
+            snapshot.aimActive = aimActive;
             snapshot.shapeRejections = detection.shapeRejections;
             snapshot.profileRejections = detection.profileRejections;
             snapshot.silhouetteTelemetry =
@@ -1465,7 +1507,16 @@ void detectionLoop(
                 std::lock_guard lock(state->snapshotMutex);
                 state->snapshot = snapshot;
             }
-            PostMessageW(overlayWindow, kSnapshotMessage, 0, 0);
+            // Repainting a full-screen layered window is far more expensive
+            // than analyzing the ROI, and at 120 FPS it floods the UI thread
+            // with more redraws than a display can show. Throttling it to
+            // roughly 60 Hz leaves the detection loop free to run at its
+            // configured rate, which is what determines reaction time.
+            const auto now = Clock::now();
+            if (now - lastOverlayPost >= std::chrono::milliseconds(16)) {
+                lastOverlayPost = now;
+                PostMessageW(overlayWindow, kSnapshotMessage, 0, 0);
+            }
 
             ++frameCount;
             if (config.maxFrames > 0 && frameCount >= config.maxFrames) {
@@ -1474,9 +1525,9 @@ void detectionLoop(
             }
 
             nextFrame += framePeriod;
-            const auto now = Clock::now();
-            if (nextFrame < now - framePeriod) {
-                nextFrame = now;
+            const auto scheduleNow = Clock::now();
+            if (nextFrame < scheduleNow - framePeriod) {
+                nextFrame = scheduleNow;
             }
             std::this_thread::sleep_until(nextFrame);
         }
