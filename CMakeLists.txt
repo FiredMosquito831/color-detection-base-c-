@@ -9,8 +9,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_library(detector_core detector_core.cpp)
 target_include_directories(detector_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
-add_executable(color_detector main.cpp)
-target_link_libraries(color_detector PRIVATE detector_core user32 gdi32)
+add_executable(color_detector main.cpp screen_capture.cpp)
+# d3d11/dxgi back the Desktop Duplication capture path; dxguid supplies the
+# interface GUIDs that MinGW does not emit inline.
+target_link_libraries(color_detector PRIVATE detector_core user32 gdi32 d3d11 dxgi dxguid)
 target_compile_definitions(color_detector PRIVATE WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
 
 add_executable(color_target_demo WIN32 target_demo.cpp)
@@ -27,7 +29,7 @@ if(MSVC)
     target_compile_options(detector_core_tests PRIVATE /W4 /permissive-)
 else()
     target_compile_options(detector_core PRIVATE -Wall -Wextra -Wpedantic)
-    target_compile_options(color_detector PRIVATE -Wall -Wextra -Wpedantic)
+    target_compile_options(color_detector PRIVATE -Wall -Wextra)
     target_compile_options(color_target_demo PRIVATE -Wall -Wextra -Wpedantic)
     target_compile_options(detector_core_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()

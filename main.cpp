@@ -4,6 +4,7 @@
 #include <shellapi.h>
 
 #include "detector_core.hpp"
+#include "screen_capture.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -51,6 +52,7 @@ struct AppConfig {
     bool keyTestRequested{false};
     bool elevateRequested{false};
     bool detectorOnlyRequested{false};
+    colorbot::CaptureBackend captureBackend{colorbot::CaptureBackend::Automatic};
     bool persistenceEnabled{false};
     double persistenceDecay{0.80};
     double persistenceThreshold{0.45};
@@ -272,6 +274,7 @@ void printHelp() {
         << "  --click                 Alias for --trigger\n"
         << "  --track                 Hold tracking key to pin/follow the closest target\n"
         << "  --detector-only         Observe and draw only; no keys actuate anything\n"
+        << "  --capture BACKEND       Screen capture: auto, dxgi, or gdi (default auto)\n"
         << "  --trigger-key KEY       Hold key for trigger mode (default Mouse 4)\n"
         << "  --track-key KEY         Hold key for tracking mode (default Mouse 5)\n"
         << "  --trigger-toggle-key KEY  Latching toggle for trigger mode (default -)\n"
@@ -348,6 +351,18 @@ void printHelp() {
             config.trackingEnabled = true;
         } else if (option == "--detector-only") {
             config.detectorOnlyRequested = true;
+        } else if (option == "--capture") {
+            const std::string backend = requireValue(index, argc, argv, "--capture");
+            if (backend == "auto") {
+                config.captureBackend = colorbot::CaptureBackend::Automatic;
+            } else if (backend == "gdi") {
+                config.captureBackend = colorbot::CaptureBackend::Gdi;
+            } else if (backend == "dxgi" || backend == "duplication") {
+                config.captureBackend = colorbot::CaptureBackend::DesktopDuplication;
+            } else {
+                throw std::invalid_argument(
+                    "Unsupported capture backend '" + backend + "'. Use auto, dxgi, or gdi.");
+            }
         } else if (option == "--keytest") {
             config.keyTestRequested = true;
         } else if (option == "--elevate") {
@@ -600,81 +615,6 @@ void printHelp() {
     }
     return config;
 }
-
-class ScreenRoiCapture {
-public:
-    ScreenRoiCapture(int width, int height) : width_(width), height_(height), stride_(width * 4) {
-        screenDc_ = GetDC(nullptr);
-        if (!screenDc_) {
-            throw std::runtime_error("GetDC failed");
-        }
-        memoryDc_ = CreateCompatibleDC(screenDc_);
-        if (!memoryDc_) {
-            releaseResources();
-            throw std::runtime_error("CreateCompatibleDC failed");
-        }
-
-        BITMAPINFO info{};
-        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = width_;
-        info.bmiHeader.biHeight = -height_;  // top-down image
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB;
-        bitmap_ = CreateDIBSection(screenDc_, &info, DIB_RGB_COLORS, reinterpret_cast<void**>(&pixels_), nullptr, 0);
-        if (!bitmap_ || !pixels_) {
-            releaseResources();
-            throw std::runtime_error("CreateDIBSection failed");
-        }
-        previousBitmap_ = SelectObject(memoryDc_, bitmap_);
-        if (!previousBitmap_ || previousBitmap_ == HGDI_ERROR) {
-            previousBitmap_ = nullptr;
-            releaseResources();
-            throw std::runtime_error("SelectObject failed");
-        }
-    }
-
-    ScreenRoiCapture(const ScreenRoiCapture&) = delete;
-    ScreenRoiCapture& operator=(const ScreenRoiCapture&) = delete;
-
-    ~ScreenRoiCapture() { releaseResources(); }
-
-    [[nodiscard]] bool capture(int screenX, int screenY) {
-        return BitBlt(memoryDc_, 0, 0, width_, height_, screenDc_, screenX, screenY, SRCCOPY) != FALSE;
-    }
-
-    [[nodiscard]] const std::uint8_t* pixels() const { return pixels_; }
-    [[nodiscard]] int stride() const { return stride_; }
-
-private:
-    void releaseResources() noexcept {
-        if (memoryDc_ && previousBitmap_ && previousBitmap_ != HGDI_ERROR) {
-            SelectObject(memoryDc_, previousBitmap_);
-        }
-        if (bitmap_) {
-            DeleteObject(bitmap_);
-        }
-        if (memoryDc_) {
-            DeleteDC(memoryDc_);
-        }
-        if (screenDc_) {
-            ReleaseDC(nullptr, screenDc_);
-        }
-        previousBitmap_ = nullptr;
-        bitmap_ = nullptr;
-        memoryDc_ = nullptr;
-        screenDc_ = nullptr;
-        pixels_ = nullptr;
-    }
-    int width_{};
-    int height_{};
-    int stride_{};
-    HDC screenDc_{};
-    HDC memoryDc_{};
-    HBITMAP bitmap_{};
-    HGDIOBJ previousBitmap_{};
-    std::uint8_t* pixels_{};
-};
 
 // Press and release are sent as two separate events separated in time.
 //
@@ -1141,7 +1081,14 @@ void detectionLoop(
         const int gateTop = roiTop + (roiHeight - gateHeight) / 2;
         const RECT gate{gateLeft, gateTop, gateLeft + gateWidth, gateTop + gateHeight};
 
-        ScreenRoiCapture capture(roiWidth, roiHeight);
+        std::string captureFallbackReason;
+        auto capture = colorbot::createScreenCapture(
+            config.captureBackend, roiWidth, roiHeight, captureFallbackReason);
+        if (!captureFallbackReason.empty()) {
+            std::cerr << "Desktop Duplication unavailable (" << captureFallbackReason
+                      << "); using GDI capture, which is markedly slower.\n";
+        }
+        std::cout << "capture backend: " << capture->backendName() << '\n';
         std::optional<colorbot::PersistenceAccumulator> persistence;
         if (config.persistenceEnabled) {
             persistence.emplace(
@@ -1296,14 +1243,14 @@ void detectionLoop(
             }
 
             const auto processingStart = Clock::now();
-            if (!capture.capture(roiLeft, roiTop)) {
+            if (!capture->capture(roiLeft, roiTop)) {
                 throw std::runtime_error("BitBlt screen capture failed");
             }
             const colorbot::DetectionResult detection = colorbot::analyzeBgra(
-                capture.pixels(),
+                capture->pixels(),
                 roiWidth,
                 roiHeight,
-                capture.stride(),
+                capture->stride(),
                 config.targets,
                 config.detection,
                 persistence ? &*persistence : nullptr,

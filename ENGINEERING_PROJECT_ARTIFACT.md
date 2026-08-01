@@ -404,6 +404,49 @@ The original 36 `GetPixel` calls were replaced by `ScreenRoiCapture`.
 - Target rate: `120 FPS`.
 - ROI position: center of the actual primary screen.
 
+### Measured frame cost and why GPU compute is not the answer
+
+A common instinct is to move the classifier to the GPU. Measurement does not
+support it. For the default 256x192 ROI:
+
+```text
+BitBlt capture      wall 7.14 ms   CPU 0.25 ms
+Desktop Duplication wall 7.41 ms   CPU 0.12 ms
+analysis, default        0.48 ms
+analysis, thermal-human  1.47 ms
+```
+
+Two conclusions follow.
+
+First, capture dominates **wall** time but barely registers in **CPU** time.
+The seven milliseconds are spent blocked waiting for the display to produce a
+new frame, not computing. Under a continuously animating window both backends
+observed roughly 63 genuinely distinct frames per second. That is the real
+ceiling on reaction time: the detector cannot see a change before the display
+publishes it, and no amount of compute acceleration moves that number.
+
+Second, the analysis is already small. Moving 1.47 ms of work to the GPU could
+save at most 1.47 ms of an 8.6 ms frame, while adding an upload, a kernel
+launch, and a readback whose synchronization typically costs more than the
+work saved. GPU offload is a throughput optimization, and this is a latency
+problem on a small image.
+
+The capture backend was still worth changing, for reasons other than speed:
+Desktop Duplication halves CPU use and delivers tear-free composited frames,
+whereas GDI reads the front buffer and can return partially composited
+content.
+
+### Desktop Duplication acquisition timeout
+
+`AcquireNextFrame` is called with a small non-zero timeout. A zero timeout was
+measured returning `DXGI_ERROR_WAIT_TIMEOUT` on every single call: **zero
+distinct frames out of 250**, because a frame is essentially never already
+pending at the instant of the call. The buffer would then never be filled and
+the detector would analyze blank pixels forever, silently. A timeout of a few
+milliseconds recovers normal delivery, and a genuine timeout then means the
+desktop really is unchanged, so reusing the previous buffer is correct rather
+than stale.
+
 ### Why CPU processing is appropriate
 
 At `256x192`, the classifier operates on 49,152 pixels. GPU acceleration would add synchronization and transfer overhead unless:
@@ -1456,8 +1499,12 @@ F8 pauses:
 
 ### Capture
 
-- Uses GDI `BitBlt`, not Desktop Duplication or Windows Graphics Capture.
+- Uses Desktop Duplication when available and falls back to GDI `BitBlt`.
+- Windows Graphics Capture is not implemented.
 - Captures the primary screen only.
+- Detection cannot outrun the display: roughly 63 distinct frames per second
+  were observed, so a higher `--fps` re-analyzes frames rather than seeing new
+  ones.
 - Display changes during execution do not recreate the capture surface.
 - `SetProcessDPIAware` is used, but multi-monitor per-monitor-DPI behavior is not implemented.
 

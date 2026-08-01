@@ -114,6 +114,7 @@ Bring the target fixture to the foreground. Hold `Mouse 4` while target A crosse
 | `--trigger` | Enable hold-to-trigger controller | disabled |
 | `--track` | Enable hold-to-pin/follow controller | disabled |
 | `--detector-only` | Observe and draw only; no key actuates anything | disabled |
+| `--capture BACKEND` | Screen capture: `auto`, `dxgi`, or `gdi` | `auto` |
 | `--trigger-key KEY` | Trigger activation key | `Mouse 4` |
 | `--track-key KEY` | Tracking activation key | `Mouse 5` |
 | `--trigger-toggle-key KEY` | Latching toggle for trigger mode | `-` |
